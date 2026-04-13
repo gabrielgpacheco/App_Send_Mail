@@ -3,7 +3,19 @@
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 
-//print_r($_POST);
+// Start session for CSRF protection and rate limiting
+if (session_status() === PHP_SESSION_NONE) {
+	session_start();
+}
+
+// Set secure headers
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('X-XSS-Protection: 1; mode=block');
+header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+
+// Load configuration from environment or config file
+$config = require 'config.php';
 
 class Message
 {
@@ -22,9 +34,23 @@ class Message
 		$this->$atributo = $valor;
 	}
 
+	/**
+	 * Validate message with security checks
+	 * @return bool
+	 */
 	public function messageValida()
 	{
 		if (empty($this->to) || empty($this->subject) || empty($this->message)) {
+			return false;
+		}
+
+		// Validate email format
+		if (!filter_var($this->to, FILTER_VALIDATE_EMAIL)) {
+			return false;
+		}
+
+		// Check length limits to prevent DoS
+		if (strlen($this->subject) > 255 || strlen($this->message) > 10000) {
 			return false;
 		}
 
@@ -32,55 +58,113 @@ class Message
 	}
 }
 
+// Only process POST requests
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+	http_response_code(405);
+	die('Method Not Allowed');
+}
+
+// Verify CSRF token
+if (!isset($_POST['csrf_token']) || !isset($_SESSION['csrf_token']) || 
+	$_POST['csrf_token'] !== $_SESSION['csrf_token']) {
+	http_response_code(403);
+	die('Invalid CSRF token. Please try again.');
+}
+
+// Rate limiting: Check if user has exceeded email limit (5 emails per minute)
+$rate_limit_key = 'email_sent_' . (getenv('REMOTE_ADDR') ?: $_SERVER['REMOTE_ADDR']);
+if (!isset($_SESSION[$rate_limit_key])) {
+	$_SESSION[$rate_limit_key] = ['count' => 0, 'timestamp' => time()];
+}
+
+$current_time = time();
+$last_check = $_SESSION[$rate_limit_key]['timestamp'];
+
+// Reset counter if more than 60 seconds have passed
+if ($current_time - $last_check > 60) {
+	$_SESSION[$rate_limit_key] = ['count' => 0, 'timestamp' => $current_time];
+}
+
+// Check rate limit
+if ($_SESSION[$rate_limit_key]['count'] >= 5) {
+	http_response_code(429);
+	die('Too many requests. Please try again later.');
+}
+
+$_SESSION[$rate_limit_key]['count']++;
+
 $message = new Message();
 
-$message->__set('to', $_POST['to']);
-$message->__set('subject', $_POST['subject']);
-$message->__set('message', $_POST['message']);
+// Sanitize input data
+$to = isset($_POST['to']) ? trim($_POST['to']) : '';
+$subject = isset($_POST['subject']) ? trim($_POST['subject']) : '';
+$body = isset($_POST['message']) ? trim($_POST['message']) : '';
 
+$message->__set('to', $to);
+$message->__set('subject', $subject);
+$message->__set('message', $body);
 
 if (!$message->messageValida()) {
-	echo 'Mensagem não é válida';
-	//die();
+	$message->status['codigo_status'] = 3;
+	$message->status['descricao_status'] = 'Mensagem não é válida. Verifique os dados e tente novamente.';
+	// Redirect to prevent form resubmission
+	header('Location: index.php?status=invalid');
+	exit;
 }
 
 $mail = new PHPMailer(true);
 try {
-	//Server settings
-	$mail->SMTPDebug = false;                      //Enable verbose debug output
-	$mail->isSMTP();                                            //Send using SMTP
-	$mail->Host       = 'smtp.gmail.com';                     //Set the SMTP server to send through
-	$mail->SMTPAuth   = true;                                   //Enable SMTP authentication
-	$mail->Username   = 'youremail@gmail.com';                     //SMTP username
-	$mail->Password   = 'yourpassword';                               //SMTP password
-	$mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;         //Enable TLS encryption; `PHPMailer::ENCRYPTION_SMTPS` encouraged
-	$mail->Port       = 587;                                    //TCP port to connect to, use 465 for `PHPMailer::ENCRYPTION_SMTPS` above
+	// Server settings with credentials from config/environment
+	$mail->SMTPDebug = 0; // Set to 2 for debugging (but only in development!)
+	$mail->isSMTP();
+	$mail->Host = $config['smtp_host'];
+	$mail->SMTPAuth = true;
+	$mail->Username = $config['smtp_username'];
+	$mail->Password = $config['smtp_password'];
+	
+	// Use TLS by default, SMTPS for port 465
+	if ($config['smtp_port'] === 465) {
+		$mail->SMTPSecure = PHPMailer::ENCRYPTION_SMTPS;
+	} else {
+		$mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
+	}
+	$mail->Port = $config['smtp_port'];
 
-	//Recipients
-	$mail->setFrom('youremail@gmail.com', 'Your name');
-	$mail->addAddress($message->__get('to'));     //Add a recipient
-	//$mail->addReplyTo('info@example.com', 'Information');
-	//$mail->addCC('cc@example.com');
-	//$mail->addBCC('bcc@example.com');
+	// Set timeout to prevent hanging
+	$mail->Timeout = 10;
 
-	//Attachments
-	//$mail->addAttachment('/var/tmp/file.tar.gz');         //Add attachments
-	//$mail->addAttachment('/tmp/image.jpg', 'new.jpg');    //Optional name
+	// Recipients
+	$mail->setFrom($config['smtp_from_email'], $config['smtp_from_name']);
+	$mail->addAddress(filter_var($message->__get('to'), FILTER_VALIDATE_EMAIL));
 
-	//Content
-	$mail->isHTML(true);                                  //Set email format to HTML
+	// Content
+	$mail->isHTML(true);
 	$mail->Subject = $message->__get('subject');
-	$mail->Body    = $message->__get('message');
+	$mail->Body = $message->__get('message');
 	$mail->AltBody = 'É necessario utilizar um client que suporte HTML para ter acesso total ao conteúdo dessa mensagem';
 
 	$mail->send();
 
 	$message->status['codigo_status'] = 1;
-	$message->status['descricao_status'] = 'E-mail enviado com sucesso';
-} catch (Exception $e) {
+	$message->status['descricao_status'] = 'E-mail enviado com sucesso!';
+	
+	// Store success message in session and redirect to prevent resubmission
+	$_SESSION['success_message'] = $message->status['descricao_status'];
+	header('Location: result.php?status=success');
+	exit;
 
+} catch (Exception $e) {
+	// Log detailed error server-side (not shown to user)
+	error_log('Email sending failed: ' . $mail->ErrorInfo);
+	
 	$message->status['codigo_status'] = 2;
-	$message->status['descricao_status'] = 'Não foi possivel enviar este e-mail! Por favor tente novamente mais tarde. Detalhes do erro: ' . $mail->ErrorInfo;
+	// Generic error message - no detailed information exposed
+	$message->status['descricao_status'] = 'Não foi possível enviar este e-mail. Por favor tente novamente mais tarde.';
+	
+	// Store error in session and redirect
+	$_SESSION['error_message'] = $message->status['descricao_status'];
+	header('Location: result.php?status=error');
+	exit;
 }
 ?>
 
